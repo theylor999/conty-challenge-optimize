@@ -112,3 +112,52 @@ describe("casos de borda da listagem", () => {
     expect(result.total).toBe(4);
   });
 });
+
+describe("listagem com volume maior que o seed", () => {
+  it("mantém a ordem nos empates, sem repetir nem perder criador entre páginas, e devolve vazio além do fim", async () => {
+    const db = openDatabase(":memory:");
+    seed(db, { creators: 2000, seed: 7 });
+    // Todas as métricas empatam em captured_at e em views: o alcance só depende de quantas contas a pessoa tem.
+    db.exec("UPDATE metrics SET views = 1000, captured_at = '2026-05-01T00:00:00.000Z'");
+    const app = createApp(db);
+
+    const campaign = db.prepare("SELECT niches_json FROM campaigns WHERE id = ?").get(CAMPAIGN_ID) as { niches_json: string };
+    const campaignNiches = JSON.parse(campaign.niches_json) as string[];
+    const accountsWithMetric = new Map(
+      (
+        db
+          .prepare(
+            "SELECT creator_id, COUNT(*) AS n FROM social_accounts a WHERE EXISTS (SELECT 1 FROM metrics m WHERE m.account_id = a.id) GROUP BY creator_id",
+          )
+          .all() as { creator_id: string; n: number }[]
+      ).map((row) => [row.creator_id, row.n]),
+    );
+    const expected = (db.prepare("SELECT id, niches_json FROM creators").all() as { id: string; niches_json: string }[])
+      .map((creator) => ({
+        id: creator.id,
+        niche_score: (JSON.parse(creator.niches_json) as string[]).filter((niche) => campaignNiches.includes(niche)).length,
+        latest_reach: 1000 * (accountsWithMetric.get(creator.id) ?? 0),
+      }))
+      .filter((creator) => creator.niche_score > 0)
+      .sort((a, b) => b.niche_score - a.niche_score || b.latest_reach - a.latest_reach || (a.id < b.id ? -1 : 1));
+    expect(expected.length).toBeGreaterThan(100);
+
+    const listed: { id: string; niche_score: number; latest_reach: number }[] = [];
+    for (let offset = 0; ; offset += 50) {
+      resetQueryCount();
+      const res = await app.request(`/campaigns/${CAMPAIGN_ID}/creators?limit=50&offset=${offset}`);
+      const result = (await res.json()) as Page;
+      expect(getQueryCount()).toBeLessThanOrEqual(8);
+      expect(result.total).toBe(expected.length);
+      if (result.creators.length === 0) break;
+      for (const creator of result.creators) {
+        listed.push({ id: creator.id, niche_score: creator.niche_score, latest_reach: creator.latest_reach });
+      }
+    }
+    expect(listed).toEqual(expected);
+    const total = expected.length;
+
+    const beyond = await app.request(`/campaigns/${CAMPAIGN_ID}/creators?limit=20&offset=${total + 20}`);
+    expect(await beyond.json()).toEqual({ campaign_id: CAMPAIGN_ID, total, creators: [] });
+  });
+});
