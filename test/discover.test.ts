@@ -112,3 +112,43 @@ describe("casos de borda da listagem", () => {
     expect(result.total).toBe(4);
   });
 });
+
+describe("listagem com volume maior que o seed", () => {
+  it("mantém a ordem nos empates, sem repetir nem perder criador entre páginas, e devolve vazio além do fim", async () => {
+    const db = openDatabase(":memory:");
+    seed(db, { creators: 2000, seed: 7 });
+    // Todas as métricas empatam em captured_at e em views: o alcance só depende de quantas contas a pessoa tem.
+    db.exec("UPDATE metrics SET views = 1000, captured_at = '2026-05-01T00:00:00.000Z'");
+    const app = createApp(db);
+
+    const ids: string[] = [];
+    let previous: Page["creators"][number] | undefined;
+    let total = 0;
+    for (let offset = 0; ; offset += 50) {
+      resetQueryCount();
+      const res = await app.request(`/campaigns/${CAMPAIGN_ID}/creators?limit=50&offset=${offset}`);
+      const result = (await res.json()) as Page;
+      expect(getQueryCount()).toBeLessThanOrEqual(8);
+      total = result.total;
+      if (result.creators.length === 0) break;
+      for (const creator of result.creators) {
+        if (previous) {
+          const ordered =
+            previous.niche_score > creator.niche_score ||
+            (previous.niche_score === creator.niche_score &&
+              (previous.latest_reach > creator.latest_reach ||
+                (previous.latest_reach === creator.latest_reach && previous.id < creator.id)));
+          expect(ordered).toBe(true);
+        }
+        previous = creator;
+        ids.push(creator.id);
+      }
+    }
+    expect(total).toBeGreaterThan(100);
+    expect(ids).toHaveLength(total);
+    expect(new Set(ids).size).toBe(total);
+
+    const beyond = await app.request(`/campaigns/${CAMPAIGN_ID}/creators?limit=20&offset=${total + 20}`);
+    expect(await beyond.json()).toEqual({ campaign_id: CAMPAIGN_ID, total, creators: [] });
+  });
+});
